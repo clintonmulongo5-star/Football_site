@@ -10,16 +10,14 @@ Run locally:
     pip install flask requests
     python app.py
 Then open http://127.0.0.1:5000 in a browser on the same device.
-
-Environment variables:
-    FOOTBALL_DATA_API_KEY  football-data.org key (European leagues etc.)
-    API_FOOTBALL_KEY       optional; API-Football key that turns on the
-                           local East African leagues (Kenya/Tanzania/Uganda)
 """
 
 import os
+import ast
 import math
+import time
 import sqlite3
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -40,42 +38,6 @@ HEADERS = {"X-Auth-Token": API_KEY}
 DB_PATH = os.environ.get("FOOTBALL_DB_PATH", "football_data.db")
 COMPETITIONS = ["PL", "PD", "SA", "BL1", "FL1", "CL", "DED", "PPL", "ELC", "BSA", "WC", "EC"]
 
-# --- Local (East African) leagues -------------------------------------
-# football-data.org's free plan has no African leagues, so these come from
-# API-Football (https://www.api-football.com). Set API_FOOTBALL_KEY to turn
-# them on; without it the app runs exactly as before with the 12 above.
-# NOTE: API-Football's FREE plan only serves old seasons (2022-2024), so
-# current fixtures need a paid plan (Pro).
-API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
-API_FOOTBALL_URL = "https://v3.football.api-sports.io"
-API_FOOTBALL_HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
-
-# code -> how to find the league. The league id is looked up automatically
-# by country + name and cached in the database. If a league is missing or
-# the wrong one gets picked, put its API-Football id in "id" to force it.
-LOCAL_LEAGUES = {
-    "KEN": {"country": "Kenya",    "name": "Kenya Premier League",
-            "match": ("premier league",),          "id": None},
-    "TAN": {"country": "Tanzania", "name": "Tanzania Premier League",
-            "match": ("ligi kuu", "premier league"), "id": None},
-    "UGA": {"country": "Uganda",   "name": "Uganda Premier League",
-            "match": ("premier league",),          "id": None},
-}
-
-# API-Football fixture ids could clash with football-data.org match ids
-# (both are plain integers in one table), so local ids get a big offset.
-LOCAL_ID_OFFSET = 1_000_000_000
-
-# API-Football short status -> the status names the rest of the app uses
-API_FOOTBALL_STATUS = {
-    "NS": "TIMED", "TBD": "TIMED",
-    "FT": "FINISHED", "AET": "FINISHED", "PEN": "FINISHED",
-    "1H": "IN_PLAY", "HT": "PAUSED", "2H": "IN_PLAY", "ET": "IN_PLAY",
-    "BT": "PAUSED", "P": "IN_PLAY", "LIVE": "IN_PLAY", "INT": "PAUSED",
-    "PST": "POSTPONED", "CANC": "CANCELLED", "SUSP": "SUSPENDED",
-    "ABD": "CANCELLED", "AWD": "AWARDED", "WO": "AWARDED",
-}
-
 COMP_NAMES = {
     "PL": "Premier League",
     "PD": "La Liga",
@@ -89,10 +51,26 @@ COMP_NAMES = {
     "BSA": "Brasileiro Série A",
     "WC": "World Cup",
     "EC": "European Championship",
-    "KEN": "Kenya Premier League",
-    "TAN": "Tanzania Premier League",
-    "UGA": "Uganda Premier League",
 }
+
+# How many days of fixtures the page shows, counted from today (EAT).
+DAYS_AHEAD = 7
+# The page refreshes itself in the background when stored data is older
+# than this, or when a new day (EAT) has begun.
+REFRESH_AFTER_HOURS = 12
+# If the last refresh had failures (network down, rate limit...), try again
+# after this many hours instead of waiting for the normal interval.
+RETRY_FAILED_AFTER_HOURS = 2
+# A background timer checks this often whether the window needs refreshing,
+# so the page keeps rolling forward even if nobody opens it.
+SCHEDULER_CHECK_MINUTES = 30
+# Every page load pulls fresh fixtures, but not more often than this: the
+# free API plan allows 10 requests/minute and one refresh makes 12.
+REFRESH_MIN_GAP_SECONDS = 60
+# football-data.org FREE plan: 10 requests per minute, 12 competitions (the
+# COMPETITIONS list above is exactly those 12). Every API call goes through
+# _throttle() below, so the app can never exceed the free limit.
+FREE_PLAN_REQUESTS_PER_MINUTE = 10
 
 # East Africa Time (Nairobi, Kampala, Dar es Salaam, Addis Ababa): UTC+3,
 # no daylight saving. Data is still stored in UTC; only display is converted.
@@ -106,6 +84,17 @@ def utc_str_to_eat(utc_str):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(EAT)
+
+
+def window_bounds_utc(days_ahead=DAYS_AHEAD):
+    """The display window as UTC strings: from midnight today (EAT) up to,
+    but not including, midnight EAT `days_ahead` days later."""
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    start_eat = datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0)
+    end_eat = start_eat + timedelta(days=days_ahead)
+    return (start_eat.astimezone(timezone.utc).strftime(fmt),
+            end_eat.astimezone(timezone.utc).strftime(fmt))
+
 
 
 
@@ -138,14 +127,6 @@ def init_db():
         )
     """)
 
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS local_league_ids (
-            code TEXT PRIMARY KEY,
-            league_id INTEGER,
-            name TEXT
-        )
-    """)
-
     # Migration: earlier versions of this app didn't store half-time
     # scores. Add the columns if they're missing so existing databases
     # (with match history already collected) don't break.
@@ -163,6 +144,26 @@ def init_db():
 # ---------------------------------------------------------------------
 # DATA FETCHING
 # ---------------------------------------------------------------------
+_request_times = []
+_throttle_lock = threading.Lock()
+
+
+def _throttle():
+    """Block until one more API request fits inside the free plan's limit of
+    FREE_PLAN_REQUESTS_PER_MINUTE (measured over a rolling 61 seconds: the
+    minute plus 1 second of safety). Shared by every thread."""
+    while True:
+        with _throttle_lock:
+            now = time.monotonic()
+            while _request_times and now - _request_times[0] >= 61:
+                _request_times.pop(0)
+            if len(_request_times) < FREE_PLAN_REQUESTS_PER_MINUTE:
+                _request_times.append(now)
+                return
+            wait = 61 - (now - _request_times[0])
+        time.sleep(max(wait, 0.1))
+
+
 def fetch_matches(competition_code, date_from=None, date_to=None):
     params = {}
     if date_from:
@@ -171,7 +172,20 @@ def fetch_matches(competition_code, date_from=None, date_to=None):
         params["dateTo"] = date_to
 
     url = f"{BASE_URL}/competitions/{competition_code}/matches"
-    resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+    for attempt in range(2):
+        _throttle()
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=15)
+        if resp.status_code == 429 and attempt == 0:
+            # Shouldn't happen with _throttle(), but if the same key is also
+            # used elsewhere the server can still say "slow down": wait for
+            # its counter to reset, then retry once.
+            try:
+                wait = int(resp.headers.get("X-RequestCounter-Reset", 60))
+            except (TypeError, ValueError):
+                wait = 60
+            time.sleep(min(max(wait, 1), 65) + 1)
+            continue
+        break
 
     if resp.status_code != 200:
         raise RuntimeError(f"{competition_code}: {resp.status_code} — {resp.text[:200]}")
@@ -201,117 +215,15 @@ def store_matches(conn, matches, competition_code):
     conn.commit()
 
 
-def af_get(endpoint, params):
-    """Call API-Football. It returns HTTP 200 even for plan/quota errors and
-    reports them in an 'errors' field, so check that too."""
-    resp = requests.get(f"{API_FOOTBALL_URL}/{endpoint}",
-                        headers=API_FOOTBALL_HEADERS, params=params, timeout=15)
-    if resp.status_code != 200:
-        raise RuntimeError(f"API-Football {endpoint}: {resp.status_code} — {resp.text[:200]}")
-    data = resp.json()
-    if data.get("errors"):
-        raise RuntimeError(f"API-Football {endpoint}: {str(data['errors'])[:200]}")
-    return data.get("response", [])
-
-
-def find_local_league(conn, code):
-    """Return (league_id, league_name) for a LOCAL_LEAGUES code, looking it
-    up once by country + name and caching it in the database."""
-    cur = conn.cursor()
-    cur.execute("SELECT league_id, name FROM local_league_ids WHERE code = ?", (code,))
-    row = cur.fetchone()
-    if row:
-        return row
-
-    cfg = LOCAL_LEAGUES[code]
-    if cfg.get("id"):
-        league_id, league_name = cfg["id"], cfg["name"]
-    else:
-        skip = ("women", "u17", "u19", "u20", "u21", "u23", "youth", "cup", "reserve")
-        league_id = league_name = None
-        for item in af_get("leagues", {"country": cfg["country"], "type": "league"}):
-            name = item["league"]["name"]
-            low = name.lower()
-            if any(s in low for s in skip):
-                continue
-            if any(k in low for k in cfg["match"]):
-                league_id, league_name = item["league"]["id"], name
-                break
-        if league_id is None:
-            raise RuntimeError(
-                f"Couldn't find the {cfg['country']} league automatically — "
-                f"set its API-Football id in LOCAL_LEAGUES['{code}']['id']"
-            )
-
-    cur.execute(
-        "INSERT OR REPLACE INTO local_league_ids (code, league_id, name) VALUES (?, ?, ?)",
-        (code, league_id, league_name),
-    )
-    conn.commit()
-    return league_id, league_name
-
-
-def store_local_fixtures(conn, fixtures, code):
-    cur = conn.cursor()
-    now = datetime.now(timezone.utc).isoformat()
-    for fx in fixtures:
-        f, teams = fx["fixture"], fx["teams"]
-        score = fx.get("score") or {}
-        goals = fx.get("goals") or {}
-        ft = score.get("fulltime") or {}
-        ht = score.get("halftime") or {}
-
-        home_score = ft.get("home") if ft.get("home") is not None else goals.get("home")
-        away_score = ft.get("away") if ft.get("away") is not None else goals.get("away")
-
-        kickoff = datetime.fromisoformat(f["date"].replace("Z", "+00:00"))
-        utc_date = kickoff.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        status = API_FOOTBALL_STATUS.get(f["status"]["short"], f["status"]["short"])
-
-        cur.execute("""
-            INSERT OR REPLACE INTO matches
-            (id, competition, utc_date, status, home_team, away_team,
-             home_score, away_score, home_ht_score, away_ht_score, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            LOCAL_ID_OFFSET + f["id"], code, utc_date, status,
-            teams["home"]["name"], teams["away"]["name"],
-            home_score, away_score, ht.get("home"), ht.get("away"), now
-        ))
-    conn.commit()
-
-
-def update_local_leagues(conn, results):
-    """Pull this season's and last season's fixtures for each local league.
-    (Two seasons because leagues that run August-May straddle two calendar
-    years, and last season gives the model form data early on.)
-    Costs about 2 API-Football requests per league per refresh."""
-    if not API_FOOTBALL_KEY:
-        results["local"] = {"ok": False, "error": "API_FOOTBALL_KEY not set"}
-        return
-
-    this_year = datetime.now(timezone.utc).year
-    for code in LOCAL_LEAGUES:
-        try:
-            league_id, league_name = find_local_league(conn, code)
-            total = 0
-            for season in (this_year, this_year - 1):
-                fixtures = af_get("fixtures", {"league": league_id, "season": season})
-                store_local_fixtures(conn, fixtures, code)
-                total += len(fixtures)
-            results[code] = {"ok": True, "count": total, "league": league_name}
-        except Exception as e:
-            results[code] = {"ok": False, "error": str(e)}
-
-
 def daily_update(conn):
-    """Pull the last 365 days of finished matches + next 7 days of fixtures.
+    """Pull the last 365 days of finished matches + the next week of fixtures.
     A full year (not just 90 days) matters early in a season: without it,
     teams only have a handful of matches logged and every confidence
     label reads 'very low'. Going back a year lets the model draw on
     last season's form too, once this season has few games played."""
     date_from = (datetime.now(timezone.utc) - timedelta(days=365)).strftime("%Y-%m-%d")
-    date_to = (datetime.now(timezone.utc) + timedelta(days=7)).strftime("%Y-%m-%d")
+    # One day past the display window, so its last day is always complete.
+    date_to = (datetime.now(EAT) + timedelta(days=DAYS_AHEAD + 1)).strftime("%Y-%m-%d")
 
     results = {}
     for comp in COMPETITIONS:
@@ -321,8 +233,6 @@ def daily_update(conn):
             results[comp] = {"ok": True, "count": len(matches)}
         except Exception as e:
             results[comp] = {"ok": False, "error": str(e)}
-
-    update_local_leagues(conn, results)
 
     cur = conn.cursor()
     cur.execute(
@@ -338,6 +248,137 @@ def last_update_time(conn):
     cur.execute("SELECT ran_at FROM update_log ORDER BY id DESC LIMIT 1")
     row = cur.fetchone()
     return row[0] if row else None
+
+
+def last_update_problems(conn):
+    """Competitions that failed in the most recent refresh, as
+    (league name, reason) pairs, so the page can show why games are missing."""
+    cur = conn.cursor()
+    cur.execute("SELECT summary FROM update_log ORDER BY id DESC LIMIT 1")
+    row = cur.fetchone()
+    if not row:
+        return []
+    try:
+        results = ast.literal_eval(row[0])
+    except Exception:
+        return []
+    return [
+        (COMP_NAMES.get(code, code), str(r.get("error", "unknown error"))[:160])
+        for code, r in results.items() if not r.get("ok")
+    ]
+
+
+def needs_refresh(conn):
+    """True when the stored fixtures no longer cover the rolling 7-day window:
+    never refreshed, data older than REFRESH_AFTER_HOURS, or a new EAT day has
+    begun since the last refresh (so the newest day of the window is empty)."""
+    last = last_update_time(conn)
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    age = datetime.now(timezone.utc) - last_dt
+    if age > timedelta(hours=REFRESH_AFTER_HOURS):
+        return True
+    if age > timedelta(hours=RETRY_FAILED_AFTER_HOURS) and last_update_problems(conn):
+        return True
+    return last_dt.astimezone(EAT).date() != datetime.now(EAT).date()
+
+
+_refresh_lock = threading.Lock()
+_refresh_running = False
+
+
+def refresh_in_background():
+    """Run daily_update in a background thread so the page never waits on the
+    API (a full refresh can take a minute on the free plan). Does nothing if
+    a refresh is already running. Returns True if one was started."""
+    global _refresh_running
+    with _refresh_lock:
+        if _refresh_running:
+            return False
+        _refresh_running = True
+
+    def worker():
+        global _refresh_running
+        try:
+            conn = init_db()
+            try:
+                daily_update(conn)
+            finally:
+                conn.close()
+        except Exception as e:
+            print("Background refresh failed:", e)
+        finally:
+            with _refresh_lock:
+                _refresh_running = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return True
+
+
+def refresh_on_visit():
+    """Called on every page load: pull fresh fixtures for the next 7 days,
+    unless a refresh is already running or one finished within the last
+    REFRESH_MIN_GAP_SECONDS. Returns True if a refresh was started."""
+    if not API_KEY:
+        return False
+    conn = init_db()
+    try:
+        last = last_update_time(conn)
+    finally:
+        conn.close()
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+            if last_dt.tzinfo is None:
+                last_dt = last_dt.replace(tzinfo=timezone.utc)
+            if datetime.now(timezone.utc) - last_dt < timedelta(seconds=REFRESH_MIN_GAP_SECONDS):
+                return False
+        except ValueError:
+            pass
+    return refresh_in_background()
+
+
+def scheduler_tick():
+    """One check: refresh in the background if the 7-day window has gone stale."""
+    if not API_KEY:
+        return False
+    conn = init_db()
+    try:
+        stale = needs_refresh(conn)
+    finally:
+        conn.close()
+    return bool(stale and refresh_in_background())
+
+
+_scheduler_started = False
+
+
+def start_scheduler():
+    """Start (once) a background timer that calls scheduler_tick() every
+    SCHEDULER_CHECK_MINUTES, so the window rolls forward as time moves even
+    when nobody is looking at the page."""
+    global _scheduler_started
+    with _refresh_lock:
+        if _scheduler_started:
+            return False
+        _scheduler_started = True
+
+    def loop():
+        while True:
+            try:
+                scheduler_tick()
+            except Exception as e:
+                print("Scheduler check failed:", e)
+            time.sleep(SCHEDULER_CHECK_MINUTES * 60)
+
+    threading.Thread(target=loop, daemon=True).start()
+    return True
 
 
 # ---------------------------------------------------------------------
@@ -411,24 +452,6 @@ def get_team_ht_form(conn, team_name, n_matches=10):
 
 def poisson_pmf(k, lam):
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
-
-
-def local_league_avg_goals(conn, comp, default=1.1, min_matches=30):
-    """Goals per team per match in a local league, from its stored results.
-    The model's default (1.4) suits the big European leagues; East African
-    leagues score noticeably less (Kenya's 2025-26 season averaged ~1.1),
-    and using 1.4 would overestimate every team's expected goals."""
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT COUNT(*), AVG(home_score + away_score)
-        FROM matches
-        WHERE competition = ? AND status = 'FINISHED'
-          AND home_score IS NOT NULL AND away_score IS NOT NULL
-    """, (comp,))
-    n, avg_total = cur.fetchone()
-    if n and n >= min_matches and avg_total:
-        return avg_total / 2
-    return default
 
 
 def predict_match(conn, home_team, away_team, league_avg_goals=1.4, max_goals=6):
@@ -508,20 +531,17 @@ def predict_match(conn, home_team, away_team, league_avg_goals=1.4, max_goals=6)
     }
 
 
-def get_upcoming_fixtures(conn, days_ahead=7):
+def get_upcoming_fixtures(conn, days_ahead=DAYS_AHEAD):
     cur = conn.cursor()
-    # "Today" starts at midnight East Africa Time, converted back to UTC
-    # so it can be compared with the UTC dates stored in the database.
-    start_eat = datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0)
-    start_utc = start_eat.astimezone(timezone.utc)
-    today = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    future = (start_utc + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Window = midnight today (EAT) up to midnight EAT `days_ahead` days on,
+    # converted to UTC to compare with the UTC dates stored in the database.
+    start, end = window_bounds_utc(days_ahead)
     cur.execute("""
         SELECT home_team, away_team, utc_date, competition
         FROM matches
-        WHERE status IN ('SCHEDULED', 'TIMED') AND utc_date BETWEEN ? AND ?
+        WHERE status IN ('SCHEDULED', 'TIMED') AND utc_date >= ? AND utc_date < ?
         ORDER BY utc_date ASC
-    """, (today, future))
+    """, (start, end))
     return cur.fetchall()
 
 
@@ -532,18 +552,16 @@ def build_dashboard_data():
     conn = init_db()
     fixtures = get_upcoming_fixtures(conn)
 
-    by_date = defaultdict(list)
-    league_avgs = {}
+    # Every day of the window gets a slot (even if empty), in order.
+    today = datetime.now(EAT).date()
+    by_date = {
+        (today + timedelta(days=i)).strftime("%Y-%m-%d"): []
+        for i in range(DAYS_AHEAD)
+    }
     for home, away, utc_date, comp in fixtures:
-        if comp in LOCAL_LEAGUES:
-            if comp not in league_avgs:
-                league_avgs[comp] = local_league_avg_goals(conn, comp)
-            prediction = predict_match(conn, home, away, league_avg_goals=league_avgs[comp])
-        else:
-            prediction = predict_match(conn, home, away)
+        prediction = predict_match(conn, home, away)
         kickoff = utc_str_to_eat(utc_date)
-        day = kickoff.strftime("%Y-%m-%d")
-        by_date[day].append({
+        by_date.setdefault(kickoff.strftime("%Y-%m-%d"), []).append({
             "home": home,
             "away": away,
             "competition": COMP_NAMES.get(comp, comp),
@@ -554,9 +572,10 @@ def build_dashboard_data():
     last_update = last_update_time(conn)
     if last_update:
         last_update = utc_str_to_eat(last_update).strftime("%Y-%m-%d %H:%M")
+    problems = last_update_problems(conn)
     conn.close()
 
-    return dict(sorted(by_date.items())), last_update
+    return dict(sorted(by_date.items())), last_update, problems
 
 
 PAGE_TEMPLATE = """<!DOCTYPE html>
@@ -564,6 +583,7 @@ PAGE_TEMPLATE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+{% if refreshing %}<meta http-equiv="refresh" content="20">{% endif %}
 <title>Match Form</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;700;800&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
@@ -609,6 +629,12 @@ main { max-width: 680px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
   padding: 0.55rem 1.1rem; border-radius: 5px; cursor: pointer;
 }
 .refresh-btn:active { opacity: 0.85; }
+.window-label { color: var(--text-muted); font-size: 0.85rem; margin: -0.75rem 0 1.25rem; }
+.problems { margin: 0 0 1.25rem; padding: 0.8rem 1rem; border: 1px solid var(--away); border-radius: 8px; font-size: 0.85rem; color: var(--text-muted); }
+.problems ul { margin: 0.4rem 0 0; padding-left: 1.1rem; }
+.problems b { color: var(--text); }
+.no-matches { color: var(--text-muted); font-size: 0.9rem; margin: 0 0 1rem; }
+.refresh-btn:disabled { opacity: 0.5; cursor: default; }
 .empty-state { color: var(--text-muted); padding: 1.5rem 0; font-size: 0.95rem; }
 .day-group { margin-bottom: 2rem; }
 .day-heading {
@@ -663,21 +689,40 @@ main { max-width: 680px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
         <span class="status-label">No data yet</span>
         <span class="status-value">Run a refresh to pull fixtures</span>
       {% endif %}
+      {% if refreshing %}
+        <span class="status-value">Refreshing fixtures… the free plan allows 10 requests a minute, so this can take about a minute. The page updates itself.</span>
+      {% endif %}
     </div>
     <form action="{{ url_for('update') }}" method="post">
-      <button type="submit" class="refresh-btn">Refresh data</button>
+      <button type="submit" class="refresh-btn" {% if refreshing %}disabled{% endif %}>Refresh data</button>
     </form>
   </section>
 
-  {% if not has_data %}
-    <div class="empty-state">
-      <p>No fixtures loaded yet. Click <strong>Refresh data</strong> above to pull the next 7 days of matches and build today's estimates.</p>
+  <p class="window-label">Showing {{ window_label }} (EAT)</p>
+
+  {% if problems %}
+    <div class="problems">
+      <strong>Last refresh had problems — some fixtures may be missing:</strong>
+      <ul>
+        {% for name, why in problems %}<li><b>{{ name }}</b> — {{ why }}</li>{% endfor %}
+      </ul>
     </div>
   {% endif %}
 
-  {% for day, matches in by_date.items() %}
+  {% if not has_data %}
+    <div class="empty-state">
+      {% if refreshing %}
+        <p>Pulling the next 7 days of fixtures — this can take a minute. The page will update by itself.</p>
+      {% else %}
+        <p>No fixtures found for the next 7 days. Click <strong>Refresh data</strong> above to pull them.</p>
+      {% endif %}
+    </div>
+  {% endif %}
+
+  {% for day, matches in (by_date.items() if has_data else []) %}
     <section class="day-group">
       <h2 class="day-heading">{{ day }}</h2>
+      {% if not matches %}<p class="no-matches">No matches scheduled</p>{% endif %}
 
       {% for m in matches %}
         <article class="match-row">
@@ -740,23 +785,36 @@ main { max-width: 680px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
 
 @app.route("/")
 def index():
-    by_date, last_update = build_dashboard_data()
+    # Every time the page is opened or reloaded, re-pull the next 7 days in
+    # the background and show what we have meanwhile.
+    start_scheduler()      # no-op after the first call
+    refresh_on_visit()     # every load re-pulls the next 7 days
+
+    by_date, last_update, problems = build_dashboard_data()
+    days = list(by_date)
+    window_label = (
+        datetime.strptime(days[0], "%Y-%m-%d").strftime("%a %d %b")
+        + " – " +
+        datetime.strptime(days[-1], "%Y-%m-%d").strftime("%a %d %b")
+    )
     return render_template_string(
         PAGE_TEMPLATE,
         by_date=by_date,
         last_update=last_update,
-        has_data=bool(by_date),
+        problems=problems,
+        window_label=window_label,
+        has_data=any(by_date.values()),
+        refreshing=_refresh_running,
     )
 
 
 @app.route("/update", methods=["POST"])
 def update():
-    conn = init_db()
-    daily_update(conn)
-    conn.close()
+    refresh_in_background()
     return redirect(url_for("index"))
 
 
 if __name__ == "__main__":
+    start_scheduler()
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
