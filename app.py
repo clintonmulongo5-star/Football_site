@@ -10,6 +10,11 @@ Run locally:
     pip install flask requests
     python app.py
 Then open http://127.0.0.1:5000 in a browser on the same device.
+
+Environment variables:
+    FOOTBALL_DATA_API_KEY  football-data.org key (European leagues etc.)
+    API_FOOTBALL_KEY       optional; API-Football key that turns on the
+                           local East African leagues (Kenya/Tanzania/Uganda)
 """
 
 import os
@@ -35,6 +40,42 @@ HEADERS = {"X-Auth-Token": API_KEY}
 DB_PATH = os.environ.get("FOOTBALL_DB_PATH", "football_data.db")
 COMPETITIONS = ["PL", "PD", "SA", "BL1", "FL1", "CL", "DED", "PPL", "ELC", "BSA", "WC", "EC"]
 
+# --- Local (East African) leagues -------------------------------------
+# football-data.org's free plan has no African leagues, so these come from
+# API-Football (https://www.api-football.com). Set API_FOOTBALL_KEY to turn
+# them on; without it the app runs exactly as before with the 12 above.
+# NOTE: API-Football's FREE plan only serves old seasons (2022-2024), so
+# current fixtures need a paid plan (Pro).
+API_FOOTBALL_KEY = os.environ.get("API_FOOTBALL_KEY", "")
+API_FOOTBALL_URL = "https://v3.football.api-sports.io"
+API_FOOTBALL_HEADERS = {"x-apisports-key": API_FOOTBALL_KEY}
+
+# code -> how to find the league. The league id is looked up automatically
+# by country + name and cached in the database. If a league is missing or
+# the wrong one gets picked, put its API-Football id in "id" to force it.
+LOCAL_LEAGUES = {
+    "KEN": {"country": "Kenya",    "name": "Kenya Premier League",
+            "match": ("premier league",),          "id": None},
+    "TAN": {"country": "Tanzania", "name": "Tanzania Premier League",
+            "match": ("ligi kuu", "premier league"), "id": None},
+    "UGA": {"country": "Uganda",   "name": "Uganda Premier League",
+            "match": ("premier league",),          "id": None},
+}
+
+# API-Football fixture ids could clash with football-data.org match ids
+# (both are plain integers in one table), so local ids get a big offset.
+LOCAL_ID_OFFSET = 1_000_000_000
+
+# API-Football short status -> the status names the rest of the app uses
+API_FOOTBALL_STATUS = {
+    "NS": "TIMED", "TBD": "TIMED",
+    "FT": "FINISHED", "AET": "FINISHED", "PEN": "FINISHED",
+    "1H": "IN_PLAY", "HT": "PAUSED", "2H": "IN_PLAY", "ET": "IN_PLAY",
+    "BT": "PAUSED", "P": "IN_PLAY", "LIVE": "IN_PLAY", "INT": "PAUSED",
+    "PST": "POSTPONED", "CANC": "CANCELLED", "SUSP": "SUSPENDED",
+    "ABD": "CANCELLED", "AWD": "AWARDED", "WO": "AWARDED",
+}
+
 COMP_NAMES = {
     "PL": "Premier League",
     "PD": "La Liga",
@@ -48,8 +89,23 @@ COMP_NAMES = {
     "BSA": "Brasileiro Série A",
     "WC": "World Cup",
     "EC": "European Championship",
+    "KEN": "Kenya Premier League",
+    "TAN": "Tanzania Premier League",
+    "UGA": "Uganda Premier League",
 }
 
+# East Africa Time (Nairobi, Kampala, Dar es Salaam, Addis Ababa): UTC+3,
+# no daylight saving. Data is still stored in UTC; only display is converted.
+EAT = timezone(timedelta(hours=3), "EAT")
+
+
+def utc_str_to_eat(utc_str):
+    """Convert an ISO UTC string like '2026-09-19T15:00:00Z' (or with
+    '+00:00' / microseconds) into a datetime in East Africa Time."""
+    dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(EAT)
 
 
 
@@ -79,6 +135,14 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ran_at TEXT,
             summary TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS local_league_ids (
+            code TEXT PRIMARY KEY,
+            league_id INTEGER,
+            name TEXT
         )
     """)
 
@@ -137,6 +201,109 @@ def store_matches(conn, matches, competition_code):
     conn.commit()
 
 
+def af_get(endpoint, params):
+    """Call API-Football. It returns HTTP 200 even for plan/quota errors and
+    reports them in an 'errors' field, so check that too."""
+    resp = requests.get(f"{API_FOOTBALL_URL}/{endpoint}",
+                        headers=API_FOOTBALL_HEADERS, params=params, timeout=15)
+    if resp.status_code != 200:
+        raise RuntimeError(f"API-Football {endpoint}: {resp.status_code} — {resp.text[:200]}")
+    data = resp.json()
+    if data.get("errors"):
+        raise RuntimeError(f"API-Football {endpoint}: {str(data['errors'])[:200]}")
+    return data.get("response", [])
+
+
+def find_local_league(conn, code):
+    """Return (league_id, league_name) for a LOCAL_LEAGUES code, looking it
+    up once by country + name and caching it in the database."""
+    cur = conn.cursor()
+    cur.execute("SELECT league_id, name FROM local_league_ids WHERE code = ?", (code,))
+    row = cur.fetchone()
+    if row:
+        return row
+
+    cfg = LOCAL_LEAGUES[code]
+    if cfg.get("id"):
+        league_id, league_name = cfg["id"], cfg["name"]
+    else:
+        skip = ("women", "u17", "u19", "u20", "u21", "u23", "youth", "cup", "reserve")
+        league_id = league_name = None
+        for item in af_get("leagues", {"country": cfg["country"], "type": "league"}):
+            name = item["league"]["name"]
+            low = name.lower()
+            if any(s in low for s in skip):
+                continue
+            if any(k in low for k in cfg["match"]):
+                league_id, league_name = item["league"]["id"], name
+                break
+        if league_id is None:
+            raise RuntimeError(
+                f"Couldn't find the {cfg['country']} league automatically — "
+                f"set its API-Football id in LOCAL_LEAGUES['{code}']['id']"
+            )
+
+    cur.execute(
+        "INSERT OR REPLACE INTO local_league_ids (code, league_id, name) VALUES (?, ?, ?)",
+        (code, league_id, league_name),
+    )
+    conn.commit()
+    return league_id, league_name
+
+
+def store_local_fixtures(conn, fixtures, code):
+    cur = conn.cursor()
+    now = datetime.now(timezone.utc).isoformat()
+    for fx in fixtures:
+        f, teams = fx["fixture"], fx["teams"]
+        score = fx.get("score") or {}
+        goals = fx.get("goals") or {}
+        ft = score.get("fulltime") or {}
+        ht = score.get("halftime") or {}
+
+        home_score = ft.get("home") if ft.get("home") is not None else goals.get("home")
+        away_score = ft.get("away") if ft.get("away") is not None else goals.get("away")
+
+        kickoff = datetime.fromisoformat(f["date"].replace("Z", "+00:00"))
+        utc_date = kickoff.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        status = API_FOOTBALL_STATUS.get(f["status"]["short"], f["status"]["short"])
+
+        cur.execute("""
+            INSERT OR REPLACE INTO matches
+            (id, competition, utc_date, status, home_team, away_team,
+             home_score, away_score, home_ht_score, away_ht_score, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            LOCAL_ID_OFFSET + f["id"], code, utc_date, status,
+            teams["home"]["name"], teams["away"]["name"],
+            home_score, away_score, ht.get("home"), ht.get("away"), now
+        ))
+    conn.commit()
+
+
+def update_local_leagues(conn, results):
+    """Pull this season's and last season's fixtures for each local league.
+    (Two seasons because leagues that run August-May straddle two calendar
+    years, and last season gives the model form data early on.)
+    Costs about 2 API-Football requests per league per refresh."""
+    if not API_FOOTBALL_KEY:
+        results["local"] = {"ok": False, "error": "API_FOOTBALL_KEY not set"}
+        return
+
+    this_year = datetime.now(timezone.utc).year
+    for code in LOCAL_LEAGUES:
+        try:
+            league_id, league_name = find_local_league(conn, code)
+            total = 0
+            for season in (this_year, this_year - 1):
+                fixtures = af_get("fixtures", {"league": league_id, "season": season})
+                store_local_fixtures(conn, fixtures, code)
+                total += len(fixtures)
+            results[code] = {"ok": True, "count": total, "league": league_name}
+        except Exception as e:
+            results[code] = {"ok": False, "error": str(e)}
+
+
 def daily_update(conn):
     """Pull the last 365 days of finished matches + next 7 days of fixtures.
     A full year (not just 90 days) matters early in a season: without it,
@@ -154,6 +321,8 @@ def daily_update(conn):
             results[comp] = {"ok": True, "count": len(matches)}
         except Exception as e:
             results[comp] = {"ok": False, "error": str(e)}
+
+    update_local_leagues(conn, results)
 
     cur = conn.cursor()
     cur.execute(
@@ -244,6 +413,24 @@ def poisson_pmf(k, lam):
     return (lam ** k) * math.exp(-lam) / math.factorial(k)
 
 
+def local_league_avg_goals(conn, comp, default=1.1, min_matches=30):
+    """Goals per team per match in a local league, from its stored results.
+    The model's default (1.4) suits the big European leagues; East African
+    leagues score noticeably less (Kenya's 2025-26 season averaged ~1.1),
+    and using 1.4 would overestimate every team's expected goals."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*), AVG(home_score + away_score)
+        FROM matches
+        WHERE competition = ? AND status = 'FINISHED'
+          AND home_score IS NOT NULL AND away_score IS NOT NULL
+    """, (comp,))
+    n, avg_total = cur.fetchone()
+    if n and n >= min_matches and avg_total:
+        return avg_total / 2
+    return default
+
+
 def predict_match(conn, home_team, away_team, league_avg_goals=1.4, max_goals=6):
     home_form = get_team_form(conn, home_team)
     away_form = get_team_form(conn, away_team)
@@ -323,8 +510,12 @@ def predict_match(conn, home_team, away_team, league_avg_goals=1.4, max_goals=6)
 
 def get_upcoming_fixtures(conn, days_ahead=7):
     cur = conn.cursor()
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    future = (datetime.now(timezone.utc) + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+    # "Today" starts at midnight East Africa Time, converted back to UTC
+    # so it can be compared with the UTC dates stored in the database.
+    start_eat = datetime.now(EAT).replace(hour=0, minute=0, second=0, microsecond=0)
+    start_utc = start_eat.astimezone(timezone.utc)
+    today = start_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    future = (start_utc + timedelta(days=days_ahead)).strftime("%Y-%m-%dT%H:%M:%SZ")
     cur.execute("""
         SELECT home_team, away_team, utc_date, competition
         FROM matches
@@ -342,18 +533,27 @@ def build_dashboard_data():
     fixtures = get_upcoming_fixtures(conn)
 
     by_date = defaultdict(list)
+    league_avgs = {}
     for home, away, utc_date, comp in fixtures:
-        prediction = predict_match(conn, home, away)
-        day = utc_date[:10]
+        if comp in LOCAL_LEAGUES:
+            if comp not in league_avgs:
+                league_avgs[comp] = local_league_avg_goals(conn, comp)
+            prediction = predict_match(conn, home, away, league_avg_goals=league_avgs[comp])
+        else:
+            prediction = predict_match(conn, home, away)
+        kickoff = utc_str_to_eat(utc_date)
+        day = kickoff.strftime("%Y-%m-%d")
         by_date[day].append({
             "home": home,
             "away": away,
             "competition": COMP_NAMES.get(comp, comp),
-            "time": utc_date[11:16],
+            "time": kickoff.strftime("%H:%M"),
             "prediction": prediction,
         })
 
     last_update = last_update_time(conn)
+    if last_update:
+        last_update = utc_str_to_eat(last_update).strftime("%Y-%m-%d %H:%M")
     conn.close()
 
     return dict(sorted(by_date.items())), last_update
@@ -458,7 +658,7 @@ main { max-width: 680px; margin: 0 auto; padding: 1.5rem 1.5rem 3rem; }
     <div class="status-text">
       {% if last_update %}
         <span class="status-label">Data last pulled</span>
-        <span class="status-value">{{ last_update[:16].replace('T', ' ') }} UTC</span>
+        <span class="status-value">{{ last_update }} EAT</span>
       {% else %}
         <span class="status-label">No data yet</span>
         <span class="status-value">Run a refresh to pull fixtures</span>
